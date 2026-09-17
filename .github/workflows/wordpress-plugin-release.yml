@@ -1,0 +1,265 @@
+name: Reusable WordPress Plugin Release
+
+on:
+  workflow_call:
+    inputs:
+      plugin_slug:
+        required: true
+        type: string
+      plugin_file:
+        required: true
+        type: string
+      plugin_name:
+        required: true
+        type: string
+      release_version:
+        required: true
+        type: string
+      profile:
+        required: false
+        type: string
+        default: legacy
+    secrets:
+      SVN_USERNAME:
+        required: true
+      SVN_PASSWORD:
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-release:
+    name: Check and prepare release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v6
+
+      - name: Install Subversion
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes subversion
+
+      - name: Validate release
+        env:
+          PLUGIN_SLUG: ${{ inputs.plugin_slug }}
+          PLUGIN_FILE: ${{ inputs.plugin_file }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          SVN_USERNAME: ${{ secrets.SVN_USERNAME }}
+          SVN_PASSWORD: ${{ secrets.SVN_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$SVN_USERNAME" || -z "$SVN_PASSWORD" ]]; then
+            echo "SVN_USERNAME and SVN_PASSWORD secrets are required." >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Release version must contain two or three numeric components." >&2
+            exit 1
+          fi
+          current_header="$(php -r '$s=file_get_contents($argv[1]); if (!preg_match("/^\\s*\\*?\\s*Version:\\s*([0-9]+(?:\\.[0-9]+){1,2})/mi", $s, $m)) exit(1); echo $m[1];' "$PLUGIN_FILE")"
+          current_stable="$(sed -n 's/^Stable tag:[[:space:]]*//p' readme.txt | head -1 | tr -d '\r' | xargs)"
+          newest_current="$(printf '%s\n%s\n' "$current_header" "$current_stable" | sort -V | tail -1)"
+          if [[ "$RELEASE_VERSION" == "$newest_current" || "$(printf '%s\n%s\n' "$RELEASE_VERSION" "$newest_current" | sort -V | tail -1)" != "$RELEASE_VERSION" ]]; then
+            echo "Release version ${RELEASE_VERSION} must be newer than ${newest_current}." >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_VERSION}" >/dev/null 2>&1; then
+            echo "Git tag ${RELEASE_VERSION} already exists." >&2
+            exit 1
+          fi
+          if svn info "https://plugins.svn.wordpress.org/${PLUGIN_SLUG}/tags/${RELEASE_VERSION}" >/dev/null 2>&1; then
+            echo "WordPress.org tag ${RELEASE_VERSION} already exists." >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        if: inputs.profile == 'dynacat'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        if: inputs.profile == 'dynacat'
+        run: npm ci
+
+      - name: Install Chromium
+        if: inputs.profile == 'dynacat'
+        run: npx playwright install --with-deps chromium
+
+      - name: Start latest stable WordPress
+        if: inputs.profile == 'dynacat'
+        run: npm run env:start
+
+      - name: Run WordPress plugin tests
+        if: inputs.profile == 'dynacat'
+        run: npm test
+
+      - name: Read tested WordPress version
+        if: inputs.profile == 'dynacat'
+        id: wordpress
+        shell: bash
+        run: |
+          output="$(npm exec wp-env run cli -- wp core version 2>&1)"
+          printf '%s\n' "$output"
+          version="$(printf '%s\n' "$output" | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$' | tail -1)"
+          if [[ -z "$version" ]]; then
+            echo "Could not determine the tested WordPress version." >&2
+            exit 1
+          fi
+          echo "version=$(cut -d. -f1-2 <<< "$version")" >> "$GITHUB_OUTPUT"
+
+      - name: Stop WordPress
+        if: always() && inputs.profile == 'dynacat'
+        run: npm run env:stop
+
+      - name: Update DynaCat release metadata
+        if: inputs.profile == 'dynacat'
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          TESTED_UP_TO: ${{ steps.wordpress.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          php scripts/prepare-release.php "$RELEASE_VERSION" "$TESTED_UP_TO"
+          actual_tested_up_to="$(sed -n 's/^Tested up to: //p' readme.txt)"
+          if [[ "$actual_tested_up_to" != "$TESTED_UP_TO" ]]; then
+            echo "Expected Tested up to: ${TESTED_UP_TO}; found ${actual_tested_up_to}." >&2
+            exit 1
+          fi
+
+      - name: Update release metadata
+        if: inputs.profile != 'dynacat'
+        env:
+          PLUGIN_FILE: ${{ inputs.plugin_file }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          php -r '$f=$argv[1];$v=$argv[2];$s=file_get_contents($f);$n=0;$s=preg_replace_callback("/^(\\s*\\*?\\s*Version:\\s*)[0-9]+(?:\\.[0-9]+){1,2}/mi",fn($m)=>$m[1].$v,$s,1,$n);if($n!==1){fwrite(STDERR,"Could not update plugin version.\n");exit(1);}file_put_contents($f,$s);' "$PLUGIN_FILE" "$RELEASE_VERSION"
+          php -r '$f=$argv[1];$v=$argv[2];$s=file_get_contents($f);$n=0;$s=preg_replace_callback("/^(Stable tag:\\s*).+$/mi",fn($m)=>$m[1].$v,$s,1,$n);if($n!==1){fwrite(STDERR,"Could not update Stable tag.\n");exit(1);}file_put_contents($f,$s);' readme.txt "$RELEASE_VERSION"
+
+      - name: Build clean DynaCat package
+        if: inputs.profile == 'dynacat'
+        env:
+          PLUGIN_SLUG: ${{ inputs.plugin_slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "build/${PLUGIN_SLUG}"
+          mkdir -p "build/${PLUGIN_SLUG}"
+          rsync -av ./ "build/${PLUGIN_SLUG}/" --exclude-from=.distignore
+          if find "build/${PLUGIN_SLUG}" -type d -name node_modules -print -quit | grep -q .; then
+            echo "node_modules must not be present in the WordPress.org package." >&2
+            exit 1
+          fi
+
+      - name: Build clean WordPress.org package
+        if: inputs.profile != 'dynacat'
+        env:
+          PLUGIN_SLUG: ${{ inputs.plugin_slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "build/${PLUGIN_SLUG}"
+          mkdir -p "build/${PLUGIN_SLUG}"
+          rsync -av ./ "build/${PLUGIN_SLUG}/" \
+            --exclude=.git \
+            --exclude=.github \
+            --exclude=.gitignore \
+            --exclude=.distignore \
+            --exclude=_notes \
+            --exclude=build \
+            --exclude=node_modules \
+            --exclude=tests \
+            --exclude='package*.json' \
+            --exclude='playwright.config.*' \
+            --exclude=scripts
+          if find "build/${PLUGIN_SLUG}" -type d -name node_modules -print -quit | grep -q .; then
+            echo "node_modules must not be present in the WordPress.org package." >&2
+            exit 1
+          fi
+
+      - name: Run WordPress Plugin Check
+        uses: wordpress/plugin-check-action@v1
+        with:
+          build-dir: build/${{ inputs.plugin_slug }}
+
+      - name: Create installable plugin ZIP
+        env:
+          PLUGIN_SLUG: ${{ inputs.plugin_slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd build
+          zip -r "${PLUGIN_SLUG}.zip" "${PLUGIN_SLUG}"
+
+      - name: Upload installable plugin ZIP
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ inputs.plugin_slug }}-plugin-${{ github.sha }}
+          path: build/${{ inputs.plugin_slug }}.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Commit and tag checked release
+        env:
+          PLUGIN_FILE: ${{ inputs.plugin_file }}
+          PLUGIN_NAME: ${{ inputs.plugin_name }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Engage Web Plugin Bot"
+          git config user.email "plugins@engageweb.co.uk"
+          git add "$PLUGIN_FILE" readme.txt
+          git commit -m "Release ${PLUGIN_NAME} ${RELEASE_VERSION}"
+          git tag -a "$RELEASE_VERSION" -m "${PLUGIN_NAME} ${RELEASE_VERSION}"
+          git push --atomic origin HEAD:main "refs/tags/${RELEASE_VERSION}"
+
+      - name: Deploy to WordPress.org
+        env:
+          PLUGIN_SLUG: ${{ inputs.plugin_slug }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          SVN_USERNAME: ${{ secrets.SVN_USERNAME }}
+          SVN_PASSWORD: ${{ secrets.SVN_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p wordpress-svn
+          svn checkout "https://plugins.svn.wordpress.org/${PLUGIN_SLUG}/trunk" wordpress-svn/trunk
+          if svn info wordpress-svn/trunk/node_modules >/dev/null 2>&1; then
+            svn rm --force --quiet wordpress-svn/trunk/node_modules
+          fi
+          rsync -av --delete --exclude=.svn "build/${PLUGIN_SLUG}/" wordpress-svn/trunk/
+          mapfile -t missing_paths < <(svn status wordpress-svn/trunk | sed -n 's/^!       //p')
+          for path in "${missing_paths[@]}"; do
+            svn rm --force "$path"
+          done
+          svn add --force wordpress-svn/trunk
+          if find wordpress-svn/trunk -type d -name node_modules -print -quit | grep -q .; then
+            echo "node_modules must not be deployed to WordPress.org." >&2
+            exit 1
+          fi
+          if svn info "https://plugins.svn.wordpress.org/${PLUGIN_SLUG}/tags/${RELEASE_VERSION}" >/dev/null 2>&1; then
+            echo "WordPress.org tag ${RELEASE_VERSION} already exists." >&2
+            exit 1
+          fi
+          svn commit wordpress-svn/trunk \
+            --username "$SVN_USERNAME" \
+            --password "$SVN_PASSWORD" \
+            --non-interactive \
+            --no-auth-cache \
+            -m "Update trunk for ${RELEASE_VERSION}"
+          svn copy \
+            "https://plugins.svn.wordpress.org/${PLUGIN_SLUG}/trunk" \
+            "https://plugins.svn.wordpress.org/${PLUGIN_SLUG}/tags/${RELEASE_VERSION}" \
+            --username "$SVN_USERNAME" \
+            --password "$SVN_PASSWORD" \
+            --non-interactive \
+            --no-auth-cache \
+            -m "Tag ${RELEASE_VERSION}"
